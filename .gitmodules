@@ -7,3 +7,6 @@
 [submodule "Project/Lib/STM32Cubef7"]
 	path = Project/Lib/STM32Cubef7
 	url = https://github.com/menachemFried/STM32Cubef7
+[submodule "Project/CubeMX_Project/Lib/FreeRTOS-Kernel"]
+	path = Project/CubeMX_Project/Lib/FreeRTOS-Kernel
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel

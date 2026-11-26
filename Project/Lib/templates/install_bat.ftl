@@ -24,6 +24,9 @@ SET "IP_USB_HOST=0"
 SET "IP_ETH=0"
 SET "IP_FATFS=0"
 SET "IP_MBEDTLS=0"
+SET "IP_SEGGER_RTT=0"
+SET "IP_SEGGER_SYSVIEW=0"
+SET "SEGGER_SYSVIEW_OS=NONE"
 SET "FREERTOS_INTERFACE=NONE"
 
 [#list configs as dt]
@@ -33,9 +36,18 @@ SET "FREERTOS_INTERFACE=NONE"
 
 [#list peripheralParams.entrySet() as periphEntry]
 [#assign ip = periphEntry.key]
-[#assign cleanIpName = ip?replace(" ", "_")?replace("-", "_")]
+[#assign cleanIpName = ip?replace(" ", "_")?replace("-", "_")?replace(".", "_")]
 [#if ipList == ""][#assign ipList = cleanIpName][#else][#assign ipList = ipList + "," + cleanIpName][/#if]
 SET "IP_${cleanIpName}=1"
+[#if ip?starts_with("SEGGER.RTT") || ip?contains("SEGGER_RTT")]
+SET "IP_SEGGER_RTT=1"
+[/#if]
+[#if ip?starts_with("SEGGER.SystemView") || ip?contains("SEGGER_SystemView")]
+SET "IP_SEGGER_SYSVIEW=1"
+[#if periphEntry.value?? && periphEntry.value.get("SEGGERJjSystemView")??]
+SET "SEGGER_SYSVIEW_OS=${periphEntry.value.get("SEGGERJjSystemView")}"
+[/#if]
+[/#if]
 [/#list]
 SET "USED_IPS=${ipList}"
 
@@ -53,7 +65,7 @@ SET "FREERTOS_INTERFACE=NATIVE"
 
 [#list peripheralParams.entrySet() as periphEntry]
 [#assign ip = periphEntry.key]
-[#assign cleanIpName = ip?replace(" ", "_")?replace("-", "_")]
+[#assign cleanIpName = ip?replace(" ", "_")?replace("-", "_")?replace(".", "_")]
 [#if periphEntry.value?? && periphEntry.value.entrySet()?size > 0]
 REM --- ${ip} Parameters ---
 [#list periphEntry.value.entrySet() as paramEntry]
@@ -105,8 +117,10 @@ if (-not (Test-Path $fwDir)) {
 $useFreeRTOS = ($env:IP_FREERTOS -eq '1')
 $rtosInterface = $env:FREERTOS_INTERFACE
 if (-not $rtosInterface) { $rtosInterface = 'NONE' }
+$useSeggerRtt = ($env:IP_SEGGER_RTT -eq '1')
+$useSeggerSysView = ($env:IP_SEGGER_SYSVIEW -eq '1')
 
-Write-Host "Detected Configuration -> IP_FREERTOS=$($env:IP_FREERTOS), FREERTOS_INTERFACE=$rtosInterface, CMSIS_version=$($env:CFG_FREERTOS_CMSIS_version)" -ForegroundColor Cyan
+Write-Host "Detected Configuration -> IP_FREERTOS=$($env:IP_FREERTOS), FREERTOS_INTERFACE=$rtosInterface, IP_SEGGER_RTT=$($env:IP_SEGGER_RTT), IP_SEGGER_SYSVIEW=$($env:IP_SEGGER_SYSVIEW)" -ForegroundColor Cyan
 
 # Helper function: Compare source and destination files by size & SHA-256 hash, copy only if different
 function Sync-FolderFiles {
@@ -173,7 +187,45 @@ function Sync-FolderFiles {
     return $changed
 }
 
+function Add-CprojectIncludePath {
+    param(
+        [string]$CprojectFile,
+        [string]$IncludeVal
+    )
+    if (-not (Test-Path $CprojectFile)) { return 0 }
+    $cpContent = Get-Content -Path $CprojectFile -Raw
+    $anchor = '<listOptionValue builtIn="false" value="../Drivers/CMSIS/Include"/>'
+    if ($cpContent -notmatch [regex]::Escape($IncludeVal)) {
+        $insertion = $anchor + "`r`n`t`t`t`t`t`t`t`t`t" + "<listOptionValue builtIn=`"false`" value=`"$IncludeVal`"/>"
+        $newContent = $cpContent.Replace($anchor, $insertion)
+        if ($newContent -ne $cpContent) {
+            Set-Content -Path $CprojectFile -Value $newContent -NoNewline
+            Write-Host "  [CPROJECT] Added $IncludeVal to include paths" -ForegroundColor Green
+            return 1
+        }
+    }
+    return 0
+}
+
+function Remove-CprojectIncludePath {
+    param(
+        [string]$CprojectFile,
+        [string]$IncludeVal
+    )
+    if (-not (Test-Path $CprojectFile)) { return 0 }
+    $cpContent = Get-Content -Path $CprojectFile -Raw
+    $escaped = [regex]::Escape($IncludeVal)
+    $cleanedCp = $cpContent -replace "(?m)^\s*<listOptionValue builtIn=`"false`" value=`"$escaped`"/>\r?\n", ''
+    if ($cleanedCp -ne $cpContent) {
+        Set-Content -Path $CprojectFile -Value $cleanedCp -NoNewline
+        Write-Host "  [CLEANED] Removed $IncludeVal from .cproject" -ForegroundColor Yellow
+        return 1
+    }
+    return 0
+}
+
 $totalChanges = 0
+$cprojectPath = Join-Path $projectDir '.cproject'
 
 # ============================================================================
 # 4. Source 1 (Drivers/CMSIS 6.2.0): Core Headers (Include + Include/m-profile)
@@ -186,17 +238,20 @@ if (Test-Path $fwCmsisInc) {
     $prjMProfile = Join-Path $prjCmsisInc 'm-profile'
     if (Test-Path $fwMProfile) {
         $totalChanges += Sync-FolderFiles -SourceDir $fwMProfile -DestDir $prjMProfile -Filter '*.h' -RemoveStale
-    } elseif (Test-Path $prjMProfile) {
-        Remove-Item -Path $prjMProfile -Recurse -Force
-        Write-Host "  [CLEANED] Removed Drivers\CMSIS\Include\m-profile (not present in Firmware Package)" -ForegroundColor Yellow
-        $totalChanges++
+        $totalChanges += Add-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/Include/m-profile'
+    } else {
+        if (Test-Path $prjMProfile) {
+            Remove-Item -Path $prjMProfile -Recurse -Force
+            Write-Host "  [CLEANED] Removed Drivers\CMSIS\Include\m-profile (not present in Firmware Package)" -ForegroundColor Yellow
+            $totalChanges++
+        }
+        $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/Include/m-profile'
     }
 }
 
 # ============================================================================
 # 5. Source 1 (Drivers/CMSIS/RTOS2) & Source 2 (Middlewares/.../FreeRTOS)
 # ============================================================================
-$cprojectPath = Join-Path $projectDir '.cproject'
 $prjRtos2Dir = Join-Path $projectDir 'Drivers\CMSIS\RTOS2'
 $prjFreeRtosDir = Join-Path $projectDir 'Middlewares\Third_Party\FreeRTOS'
 
@@ -206,14 +261,7 @@ if (-not $useFreeRTOS) {
         Remove-Item -Path $prjRtos2Dir -Recurse -Force
         Write-Host "  [CLEANED] Removed Drivers\CMSIS\RTOS2" -ForegroundColor Yellow
     }
-    if (Test-Path $cprojectPath) {
-        $cpContent = Get-Content -Path $cprojectPath -Raw
-        $cleanedCp = $cpContent -replace '(?m)^\s*<listOptionValue builtIn="false" value="\.\./Drivers/CMSIS/RTOS2/Include"/>\r?\n', ''
-        if ($cleanedCp -ne $cpContent) {
-            Set-Content -Path $cprojectPath -Value $cleanedCp -NoNewline
-            Write-Host "  [CLEANED] Removed ../Drivers/CMSIS/RTOS2/Include from .cproject" -ForegroundColor Yellow
-        }
-    }
+    $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/RTOS2/Include'
 } else {
     $fwFreeRtosSrc = Join-Path $fwDir 'Middlewares\Third_Party\FreeRTOS\Source'
     $prjFreeRtosSrc = Join-Path $prjFreeRtosDir 'Source'
@@ -276,16 +324,10 @@ if (-not $useFreeRTOS) {
             Write-Host "  [CLEANED] Removed CMSIS V1 folder (Source\CMSIS_RTOS)" -ForegroundColor Yellow
             $totalChanges++
         }
-        if ($needDriversRtos2 -and (Test-Path $cprojectPath) -and (Test-Path $prjRtos2Inc)) {
-            $cpContent = Get-Content -Path $cprojectPath -Raw
-            $anchor = '<listOptionValue builtIn="false" value="../Drivers/CMSIS/Include"/>'
-            if ($cpContent -notmatch [regex]::Escape('../Drivers/CMSIS/RTOS2/Include')) {
-                $insertion = $anchor + "`r`n`t`t`t`t`t`t`t`t`t" + '<listOptionValue builtIn="false" value="../Drivers/CMSIS/RTOS2/Include"/>'
-                $cpContent = $cpContent.Replace($anchor, $insertion)
-                Set-Content -Path $cprojectPath -Value $cpContent -NoNewline
-                Write-Host "  [CPROJECT] Added ../Drivers/CMSIS/RTOS2/Include to include paths" -ForegroundColor Green
-                $totalChanges++
-            }
+        if ($needDriversRtos2 -and (Test-Path $prjRtos2Inc)) {
+            $totalChanges += Add-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/RTOS2/Include'
+        } else {
+            $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/RTOS2/Include'
         }
     } elseif ($rtosInterface -eq 'CMSIS_V1') {
         Write-Host "Syncing CMSIS_V1: Middlewares\...\CMSIS_RTOS only" -ForegroundColor Cyan
@@ -308,42 +350,160 @@ if (-not $useFreeRTOS) {
             Write-Host "  [CLEANED] Removed Drivers\CMSIS\RTOS2 folder" -ForegroundColor Yellow
             $totalChanges++
         }
+        $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/RTOS2/Include'
     } else {
         Write-Host "FreeRTOS Native mode: Removing CMSIS_RTOS_V1/V2 wrappers if present" -ForegroundColor Cyan
         if (Test-Path $prjCmsisV1) { Remove-Item -Path $prjCmsisV1 -Recurse -Force; $totalChanges++ }
         if (Test-Path $prjCmsisV2) { Remove-Item -Path $prjCmsisV2 -Recurse -Force; $totalChanges++ }
         if (Test-Path $prjRtos2Dir) { Remove-Item -Path $prjRtos2Dir -Recurse -Force; $totalChanges++ }
+        $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../Drivers/CMSIS/RTOS2/Include'
     }
 
-    # 5c. Ensure Core/Inc/FreeRTOSConfig.h has required defines for FreeRTOS V11 / new CMSIS-RTOS2
+    # 5c. Update Core/Inc/FreeRTOSConfig.h (FreeRTOS V11/CMSIS-RTOS2 defines + SEGGER SystemView toggle)
     $frConfigPath = Join-Path $projectDir 'Core\Inc\FreeRTOSConfig.h'
     $fwFreertosOs2H = Join-Path $fwCmsisV2 'freertos_os2.h'
-    if ((Test-Path $frConfigPath) -and (Test-Path $fwFreertosOs2H) -and ($rtosInterface -eq 'CMSIS_V2')) {
+    if (Test-Path $frConfigPath) {
         $frContent = Get-Content -Path $frConfigPath -Raw
-        $requiredDefines = @(
-            @{ Name = 'CMSIS_device_header'; Line = '#define CMSIS_device_header "stm32f7xx.h"' },
-            @{ Name = 'configKERNEL_PROVIDED_STATIC_MEMORY'; Line = '#define configKERNEL_PROVIDED_STATIC_MEMORY 1' },
-            @{ Name = 'USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION'; Line = '#define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1' },
-            @{ Name = 'INCLUDE_xTaskGetCurrentTaskHandle'; Line = '#define INCLUDE_xTaskGetCurrentTaskHandle 1' },
-            @{ Name = 'INCLUDE_xTaskAbortDelay'; Line = '#define INCLUDE_xTaskAbortDelay 1' }
-        )
+        $origFrContent = $frContent
 
-        $linesToInject = @()
-        foreach ($def in $requiredDefines) {
-            if ($frContent -notmatch "\b$($def.Name)\b") {
-                $linesToInject += $def.Line
+        $userBegin = '/* USER CODE BEGIN Defines */'
+        $userEnd   = '/* USER CODE END Defines */'
+        if ($frContent.Contains($userBegin) -and $frContent.Contains($userEnd)) {
+            $pattern = [regex]::Escape($userBegin) + '[\s\S]*?' + [regex]::Escape($userEnd)
+            $frBeforeUser = $frContent.Substring(0, $frContent.IndexOf($userBegin))
+
+            $defineLines = @()
+            if ((Test-Path $fwFreertosOs2H) -and ($rtosInterface -eq 'CMSIS_V2')) {
+                $v11Defs = @(
+                    @{ Name = 'CMSIS_device_header'; Line = '#define CMSIS_device_header "stm32f7xx.h"' },
+                    @{ Name = 'configKERNEL_PROVIDED_STATIC_MEMORY'; Line = '#define configKERNEL_PROVIDED_STATIC_MEMORY 1' },
+                    @{ Name = 'USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION'; Line = '#define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1' },
+                    @{ Name = 'INCLUDE_xTaskGetCurrentTaskHandle'; Line = '#define INCLUDE_xTaskGetCurrentTaskHandle 1' },
+                    @{ Name = 'INCLUDE_xTaskAbortDelay'; Line = '#define INCLUDE_xTaskAbortDelay 1' }
+                )
+                foreach ($d in $v11Defs) {
+                    if ($frBeforeUser -notmatch "#define\s+$($d.Name)\s+1\b") {
+                        $defineLines += $d.Line
+                    }
+                }
             }
-        }
+            if ($useSeggerSysView) {
+                if ($frBeforeUser -notmatch '#define\s+INCLUDE_xTaskGetIdleTaskHandle\s+1\b') {
+                    $defineLines += '#define INCLUDE_xTaskGetIdleTaskHandle 1'
+                }
+                if ($frBeforeUser -notmatch '#define\s+INCLUDE_pxTaskGetStackStart\s+1\b') {
+                    $defineLines += '#define INCLUDE_pxTaskGetStackStart 1'
+                }
+                $defineLines += '#define USE_SEGGER_SW 1'
+                $defineLines += '#ifndef __ASSEMBLER__'
+                $defineLines += '#include "SEGGER_SYSVIEW_FreeRTOS.h"'
+                $defineLines += '#endif'
+            } else {
+                $defineLines += '#define USE_SEGGER_SW 0'
+            }
+            $defineLines += '/* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */'
 
-        if ($linesToInject.Count -gt 0) {
-            $userDefinesMarker = '/* USER CODE BEGIN Defines */'
-            if ($frContent.Contains($userDefinesMarker)) {
-                $injectBlock = $userDefinesMarker + "`r`n" + ($linesToInject -join "`r`n")
-                $frContent = $frContent.Replace($userDefinesMarker, $injectBlock)
+            $newDefinesBlock = $userBegin + "`r`n" + ($defineLines -join "`r`n") + "`r`n" + $userEnd
+            $frContent = [regex]::Replace($frContent, $pattern, $newDefinesBlock)
+
+            if ($frContent -ne $origFrContent) {
                 Set-Content -Path $frConfigPath -Value $frContent -NoNewline
-                Write-Host "  [CONFIG] Added FreeRTOS V11/CMSIS-RTOS2 defines to FreeRTOSConfig.h" -ForegroundColor Green
+                Write-Host "  [CONFIG] Updated FreeRTOSConfig.h (USE_SEGGER_SW=$([int]$useSeggerSysView))" -ForegroundColor Green
                 $totalChanges++
             }
+        }
+    }
+}
+
+# ============================================================================
+# 6. SEGGER Cleanup (when unchecked in CubeMX) & RTG Application Folder Wiring
+# ============================================================================
+$prjSeggerDir = Join-Path $projectDir 'Middlewares\Third_Party\SEGGER_SEGGER'
+if (-not $useSeggerRtt -and -not $useSeggerSysView) {
+    if (Test-Path $prjSeggerDir) {
+        Remove-Item -Path $prjSeggerDir -Recurse -Force
+        Write-Host "  [CLEANED] Removed Middlewares\Third_Party\SEGGER_SEGGER (SEGGER disabled in CubeMX)" -ForegroundColor Yellow
+        $totalChanges++
+    }
+    foreach ($sp in @(
+        '../Middlewares/Third_Party/SEGGER_SEGGER/SEGGER',
+        '../Middlewares/Third_Party/SEGGER_SEGGER/Config',
+        '../Middlewares/Third_Party/SEGGER_SEGGER/SYSVIEW',
+        '../Middlewares/Third_Party/SEGGER_SEGGER/Sample/FreeRTOSV11',
+        '../Middlewares/Third_Party/SEGGER_SEGGER/RTT'
+    )) {
+        $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal $sp
+    }
+} elseif (-not $useSeggerSysView -and $useSeggerRtt) {
+    foreach ($sub in @('SYSVIEW', 'Sample')) {
+        $subPath = Join-Path $prjSeggerDir $sub
+        if (Test-Path $subPath) {
+            Remove-Item -Path $subPath -Recurse -Force
+            Write-Host "  [CLEANED] Removed SEGGER_SEGGER\$sub (SystemView disabled in CubeMX)" -ForegroundColor Yellow
+            $totalChanges++
+        }
+    }
+    foreach ($sp in @(
+        '../Middlewares/Third_Party/SEGGER_SEGGER/SYSVIEW',
+        '../Middlewares/Third_Party/SEGGER_SEGGER/Sample/FreeRTOSV11'
+    )) {
+        $totalChanges += Remove-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal $sp
+    }
+}
+
+# Wire RTG folder (../RTG/Inc, sourceEntry RTG, and freertos.c hooks) if RTG exists
+$prjRtgDir = Join-Path $projectDir 'RTG'
+if (Test-Path $prjRtgDir) {
+    $totalChanges += Add-CprojectIncludePath -CprojectFile $cprojectPath -IncludeVal '../RTG/Inc'
+
+    if (Test-Path $cprojectPath) {
+        $cpContent = Get-Content -Path $cprojectPath -Raw
+        if ($cpContent -notmatch '<entry[^>]+name="RTG"') {
+            $srcAnchor = '<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Core"/>'
+            $srcInsert = '<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="RTG"/>' + "`r`n`t`t`t`t`t`t" + $srcAnchor
+            $newCp = $cpContent.Replace($srcAnchor, $srcInsert)
+            if ($newCp -ne $cpContent) {
+                Set-Content -Path $cprojectPath -Value $newCp -NoNewline
+                Write-Host "  [CPROJECT] Added RTG source entry to .cproject" -ForegroundColor Green
+                $totalChanges++
+            }
+        }
+    }
+
+    $freertosCPath = Join-Path $projectDir 'Core\Src\freertos.c'
+    if (Test-Path $freertosCPath) {
+        $fcContent = Get-Content -Path $freertosCPath -Raw
+        $origFc = $fcContent
+
+        # 1. Ensure #include "rtg_main.h" in USER CODE BEGIN Includes
+        $incBegin = '/* USER CODE BEGIN Includes */'
+        $incEnd   = '/* USER CODE END Includes */'
+        if ($fcContent.Contains($incBegin) -and ($fcContent -notmatch '#include\s+"rtg_main\.h"')) {
+            $fcContent = $fcContent.Replace($incBegin, $incBegin + "`r`n#include `"rtg_main.h`"")
+        }
+
+        # 2. Ensure rtg_main(); in USER CODE BEGIN Init (inside MX_FREERTOS_Init before tasks are created)
+        $initBegin = '/* USER CODE BEGIN Init */'
+        if ($fcContent.Contains($initBegin) -and ($fcContent -notmatch '\brtg_main\s*\(\s*\)\s*;')) {
+            $fcContent = $fcContent.Replace($initBegin, $initBegin + "`r`n  rtg_main();")
+        }
+
+        # 3. Fix FreeRTOS V11 vApplicationStackOverflowHook signature (char *pcTaskName instead of signed char *pcTaskName)
+        $taskHPath = Join-Path $projectDir 'Middlewares\Third_Party\FreeRTOS\Source\include\task.h'
+        if ((Test-Path $taskHPath) -and ((Get-Content -Path $taskHPath -Raw) -match 'tskKERNEL_VERSION_MAJOR\s+11')) {
+            $fcContent = $fcContent.Replace('vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)', 'vApplicationStackOverflowHook(xTaskHandle xTask, char *pcTaskName)')
+        }
+
+        # 4. Ensure StartDefaultTask in freertos.c is __weak if overridden in RTG/Src/rtg_main.c
+        $rtgMainC = Join-Path $prjRtgDir 'Src\rtg_main.c'
+        if ((Test-Path $rtgMainC) -and ((Get-Content -Path $rtgMainC -Raw) -match '\bvoid\s+StartDefaultTask\s*\(')) {
+            $fcContent = $fcContent -replace '(?m)^void StartDefaultTask\(void \*argument\)\r?$', '__weak void StartDefaultTask(void *argument)'
+        }
+
+        if ($fcContent -ne $origFc) {
+            Set-Content -Path $freertosCPath -Value $fcContent -NoNewline
+            Write-Host "  [FREERTOS.C] Connected rtg_main.h and rtg_main() in Core\Src\freertos.c" -ForegroundColor Green
+            $totalChanges++
         }
     }
 }

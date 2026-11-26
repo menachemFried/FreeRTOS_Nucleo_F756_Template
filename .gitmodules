@@ -1,0 +1,9 @@
+[submodule "Project/Lib/SEGGER/Git/SystemView"]
+	path = Project/Lib/SEGGER/Git/SystemView
+	url = https://github.com/SEGGERMicro/SystemView
+[submodule "Project/Lib/SEGGER/Git/RTT"]
+	path = Project/Lib/SEGGER/Git/RTT
+	url = https://github.com/SEGGERMicro/RTT
+[submodule "Project/Lib/STM32Cubef7"]
+	path = Project/Lib/STM32Cubef7
+	url = https://github.com/menachemFried/STM32Cubef7
